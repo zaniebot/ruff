@@ -1579,14 +1579,18 @@ impl<'db> SpecializationBuilder<'db> {
                     return;
                 }
                 let existing = *entry.get();
-                *entry.get_mut() = UnionType::from_elements(self.db, [existing, ty]);
+                let combined = UnionType::from_elements(self.db, [existing, ty]);
+                *entry.get_mut() = combined;
 
-                // If there are any other mappings for this typevar, recursively infer the new
-                // mapping we're about to add against them, to see if they can be further unified.
+                // If the new mapping is genuinely new (i.e, it changes the union that we are
+                // tracking for the typevar), recursively infer the new mapping we're about to add
+                // against them, to see if they can be further unified.
                 // TODO: Eventually we will create a single constraint set for the entire
                 // specialization, and this step will become unnecessary.
                 // Ignore any errors unifying the mappings.
-                let _ = self.infer_map_impl(existing, ty, variance, f);
+                if existing != combined {
+                    let _ = self.infer_map_impl(existing, ty, variance, f);
+                }
             }
             Entry::Vacant(entry) => {
                 entry.insert(ty);
