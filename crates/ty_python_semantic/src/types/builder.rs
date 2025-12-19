@@ -336,11 +336,16 @@ impl<'db> UnionBuilder<'db> {
                 self.elements.reserve(new_elements.len());
                 // Capture the current element count to avoid comparing union elements against each other.
                 // The union has already been simplified, so its elements don't need redundancy checks
-                // between themselves, only against pre-existing elements. However, we only apply this
-                // optimization when not in cycle recovery AND the union's recursively_defined status
-                // matches the builder's, ensuring we're in a consistent context.
+                // between themselves, only against pre-existing elements. However, we skip this
+                // optimization if:
+                // - We're in cycle recovery mode
+                // - Either builder or union has recursively_defined=Yes (recursive type context)
+                // - The union contains @Todo types (incomplete simplification)
+                let has_todo_elements = new_elements.iter().any(|ty| ty.is_todo());
                 let batch_start = if !self.cycle_recovery
-                    && self.recursively_defined == union.recursively_defined(self.db)
+                    && self.recursively_defined == RecursivelyDefined::No
+                    && union.recursively_defined(self.db) == RecursivelyDefined::No
+                    && !has_todo_elements
                 {
                     Some(self.elements.len())
                 } else {
