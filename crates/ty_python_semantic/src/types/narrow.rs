@@ -10,6 +10,7 @@ use crate::semantic_index::scope::ScopeId;
 use crate::types::enums::{enum_member_literals, enum_metadata};
 use crate::types::function::KnownFunction;
 use crate::types::infer::infer_same_file_expression_type;
+use crate::types::typed_dict::TypedDictType;
 use crate::types::{
     CallableType, ClassLiteral, ClassType, IntersectionBuilder, KnownClass, KnownInstanceType,
     SpecialFormType, SubclassOfInner, SubclassOfType, Truthiness, Type, TypeContext,
@@ -700,6 +701,87 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
     }
 
+    /// Narrow a `TypedDict` union based on a subscript comparison.
+    ///
+    /// For `td["x"] == "foo"` where `td` is a `TypedDict` union, this narrows `td` to only
+    /// the `TypedDict` variants where field "x" could match "foo".
+    fn narrow_typed_dict_by_subscript_comparison(
+        &self,
+        base: &ast::Expr,
+        slice: &ast::Expr,
+        rhs_ty: Type<'db>,
+        op: ast::CmpOp,
+        is_positive: bool,
+        inference: &super::infer::ExpressionInference<'db>,
+    ) -> Option<Type<'db>> {
+        use ruff_python_ast::name::Name;
+
+        // Only handle == and != comparisons
+        let is_eq = match op {
+            ast::CmpOp::Eq => is_positive,
+            ast::CmpOp::NotEq => !is_positive,
+            _ => return None,
+        };
+
+        // Get the key being accessed - must be a string literal
+        let key = match slice {
+            ast::Expr::StringLiteral(lit) => Name::new(lit.value.to_str()),
+            _ => return None,
+        };
+
+        // Get the base type
+        let base_ty = inference.expression_type(base);
+
+        // Extract TypedDict types from the base (handle both single TypedDict and unions)
+        let typed_dicts: Vec<TypedDictType<'db>> = match base_ty {
+            Type::Union(union) => union
+                .elements(self.db)
+                .iter()
+                .filter_map(|ty| ty.as_typed_dict())
+                .collect(),
+            Type::TypedDict(td) => vec![td],
+            _ => return None,
+        };
+
+        // If no TypedDicts, nothing to narrow
+        if typed_dicts.is_empty() {
+            return None;
+        }
+
+        // Filter TypedDicts based on whether their field could match rhs_ty
+        let mut matching: Vec<Type<'db>> = Vec::new();
+        let mut non_matching: Vec<Type<'db>> = Vec::new();
+
+        for typed_dict in typed_dicts {
+            let items = typed_dict.items(self.db);
+            if let Some(field) = items.get(&key) {
+                let field_ty = field.declared_ty;
+                // Check if the field type could match the RHS
+                let could_match = !field_ty.is_disjoint_from(self.db, rhs_ty);
+                if could_match {
+                    matching.push(Type::TypedDict(typed_dict));
+                } else {
+                    non_matching.push(Type::TypedDict(typed_dict));
+                }
+            } else {
+                // Field doesn't exist in this TypedDict - can't match
+                non_matching.push(Type::TypedDict(typed_dict));
+            }
+        }
+
+        // For `==`, return matching variants; for `!=`, return non-matching variants
+        let result_types = if is_eq { matching } else { non_matching };
+
+        if result_types.is_empty() {
+            // If nothing matches, don't narrow (return None to keep original type)
+            None
+        } else if result_types.len() == 1 {
+            Some(result_types.into_iter().next().unwrap())
+        } else {
+            Some(UnionType::from_elements(self.db, result_types))
+        }
+    }
+
     // TODO `expr_in` and `expr_not_in` should perhaps be unified with `expr_eq` and `expr_ne`,
     // since `eq` and `ne` are equivalent to `in` and `not in` with only one element in the RHS.
     fn evaluate_expr_in(&mut self, lhs_ty: Type<'db>, rhs_ty: Type<'db>) -> Option<Type<'db>> {
@@ -876,16 +958,40 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             last_rhs_ty = Some(rhs_ty);
 
             match left {
-                ast::Expr::Name(_)
-                | ast::Expr::Attribute(_)
-                | ast::Expr::Subscript(_)
-                | ast::Expr::Named(_) => {
+                ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Named(_) => {
                     if let Some(left) = place_expr(left)
                         && let Some(ty) =
                             self.evaluate_expr_compare_op(lhs_ty, rhs_ty, *op, is_positive)
                     {
                         let place = self.expect_place(&left);
                         constraints.insert(place, ty);
+                    }
+                }
+                ast::Expr::Subscript(subscript) => {
+                    // Handle regular subscript narrowing
+                    if let Some(left) = place_expr(left)
+                        && let Some(ty) =
+                            self.evaluate_expr_compare_op(lhs_ty, rhs_ty, *op, is_positive)
+                    {
+                        let place = self.expect_place(&left);
+                        constraints.insert(place, ty);
+                    }
+
+                    // Also narrow the base of the subscript for TypedDict unions
+                    // e.g., for `td["x"] == "foo"`, narrow `td` to only TypedDict variants
+                    // where field "x" could match "foo"
+                    if let Some(narrowed_base) = self.narrow_typed_dict_by_subscript_comparison(
+                        &subscript.value,
+                        &subscript.slice,
+                        rhs_ty,
+                        *op,
+                        is_positive,
+                        inference,
+                    ) {
+                        if let Some(base_place) = place_expr(&subscript.value) {
+                            let place = self.expect_place(&base_place);
+                            constraints.insert(place, narrowed_base);
+                        }
                     }
                 }
                 ast::Expr::Call(ast::ExprCall {

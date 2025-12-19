@@ -2074,5 +2074,54 @@ nested_schema: Schema = list_schema(string_schema(0)["min_length"].__str__())
 reveal_type(nested_schema)  # revealed: ListSchema
 ```
 
+## Narrowing TypedDict unions by discriminator field
+
+TypedDict unions can be narrowed based on equality checks against the discriminator field:
+
+```py
+from typing import TypedDict, Literal
+
+class ListSchema(TypedDict):
+    type: Literal['list']
+    items: str
+
+class DictSchema(TypedDict):
+    type: Literal['dict']
+    keys: str
+    values: str
+
+class StringSchema(TypedDict):
+    type: Literal['string']
+    min_length: int
+
+def process_schema(schema: ListSchema | DictSchema | StringSchema) -> str:
+    if schema["type"] == "list":
+        reveal_type(schema)  # revealed: ListSchema
+        return schema["items"]
+    elif schema["type"] == "dict":
+        reveal_type(schema)  # revealed: DictSchema
+        return schema["keys"]
+    else:
+        reveal_type(schema)  # revealed: StringSchema
+        return str(schema["min_length"])
+```
+
+Negated comparisons also work:
+
+```py
+def process_not_list(schema: ListSchema | DictSchema | StringSchema) -> str:
+    if schema["type"] != "list":
+        reveal_type(schema)  # revealed: DictSchema | StringSchema
+        if schema["type"] == "dict":
+            reveal_type(schema)  # revealed: DictSchema
+            return schema["keys"]
+        else:
+            reveal_type(schema)  # revealed: StringSchema
+            return str(schema["min_length"])
+    else:
+        reveal_type(schema)  # revealed: ListSchema
+        return schema["items"]
+```
+
 [subtyping section]: https://typing.python.org/en/latest/spec/typeddict.html#subtyping-between-typeddict-types
 [`typeddict`]: https://typing.python.org/en/latest/spec/typeddict.html
