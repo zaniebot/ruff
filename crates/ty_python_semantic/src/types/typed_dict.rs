@@ -1049,6 +1049,124 @@ bitflags! {
 
 impl get_size2::GetSize for TypedDictFieldFlags {}
 
+/// Represents a discriminator field for a tagged `TypedDict` union.
+///
+/// A discriminated/tagged `TypedDict` union is a union of `TypedDict`s where:
+/// - All variants share a common field (the discriminator)
+/// - That field has a distinct literal type in each variant
+///
+/// For example:
+/// ```python
+/// class ListSchema(TypedDict):
+///     type: Literal['list']
+///     items: Schema
+///
+/// class DictSchema(TypedDict):
+///     type: Literal['dict']
+///     keys: Schema
+///
+/// CoreSchema = Union[ListSchema, DictSchema, ...]
+/// ```
+///
+/// Here, `type` is the discriminator field.
+#[derive(Debug, Clone)]
+pub(crate) struct TypedDictDiscriminator<'db> {
+    /// The name of the discriminator field
+    pub field_name: Name,
+    /// Map from literal string value to the `TypedDict` variants that have that value
+    pub variants: BTreeMap<&'db str, Vec<TypedDictType<'db>>>,
+}
+
+impl<'db> TypedDictDiscriminator<'db> {
+    /// Given a discriminator value, return the `TypedDict` variants that match.
+    pub(crate) fn variants_for_value(&self, value: &str) -> Option<&[TypedDictType<'db>]> {
+        self.variants.get(value).map(Vec::as_slice)
+    }
+}
+
+/// Detects if a union is a discriminated `TypedDict` union.
+///
+/// Returns the discriminator field name and a mapping from literal values to variants
+/// if all elements are `TypedDict`s with a common field that has distinct literal string types.
+pub(crate) fn detect_typed_dict_discriminator<'db>(
+    db: &'db dyn Db,
+    union_elements: &[Type<'db>],
+) -> Option<TypedDictDiscriminator<'db>> {
+    // Need at least 2 elements for a discriminated union
+    if union_elements.len() < 2 {
+        return None;
+    }
+
+    // Collect all TypedDicts from the union
+    let typed_dicts: Vec<TypedDictType<'db>> = union_elements
+        .iter()
+        .filter_map(|ty| ty.as_typed_dict())
+        .collect();
+
+    // All elements must be TypedDicts
+    if typed_dicts.len() != union_elements.len() {
+        return None;
+    }
+
+    // Find common field names across all TypedDicts
+    let first_items = typed_dicts[0].items(db);
+    let common_fields: Vec<&Name> = first_items
+        .keys()
+        .filter(|field_name| {
+            typed_dicts[1..]
+                .iter()
+                .all(|td| td.items(db).contains_key(*field_name))
+        })
+        .collect();
+
+    // Try each common field to see if it's a valid discriminator
+    for field_name in common_fields {
+        let mut variants: BTreeMap<&'db str, Vec<TypedDictType<'db>>> = BTreeMap::new();
+        let mut is_valid_discriminator = true;
+
+        for typed_dict in &typed_dicts {
+            let items = typed_dict.items(db);
+            if let Some(field) = items.get(field_name) {
+                // The discriminator field should have a string literal type
+                if let Some(literal) = field.declared_ty.as_string_literal() {
+                    let value = literal.value(db);
+                    variants.entry(value).or_default().push(*typed_dict);
+                } else {
+                    // Not a string literal, can't be a discriminator
+                    is_valid_discriminator = false;
+                    break;
+                }
+            } else {
+                is_valid_discriminator = false;
+                break;
+            }
+        }
+
+        if is_valid_discriminator && !variants.is_empty() {
+            // Each literal value should ideally map to exactly one variant
+            // (but we allow multiple for cases like inheritance)
+            return Some(TypedDictDiscriminator {
+                field_name: field_name.clone(),
+                variants,
+            });
+        }
+    }
+
+    None
+}
+
+/// Given a `TypedDict` and a discriminator, extract the literal value of the discriminator field.
+pub(crate) fn get_discriminator_value<'db>(
+    db: &'db dyn Db,
+    typed_dict: TypedDictType<'db>,
+    discriminator: &TypedDictDiscriminator<'db>,
+) -> Option<&'db str> {
+    let items = typed_dict.items(db);
+    let field = items.get(&discriminator.field_name)?;
+    let literal = field.declared_ty.as_string_literal()?;
+    Some(literal.value(db))
+}
+
 /// Yield all the key/val pairs where the same key is present in both `BTreeMap`s. Take advantage
 /// of the fact that keys are sorted to walk through each map once without doing any lookups. It
 /// would be nice if `BTreeMap` had something like `BTreeSet::intersection` that did this for us,

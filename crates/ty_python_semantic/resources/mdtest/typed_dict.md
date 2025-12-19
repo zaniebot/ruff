@@ -2019,5 +2019,60 @@ static_assert(is_disjoint_from(TD, dict[str, int]))  # error: [static-assert-err
 static_assert(is_disjoint_from(TD, dict[str, str]))  # error: [static-assert-error]
 ```
 
+## Discriminated TypedDict unions
+
+A discriminated (or "tagged") TypedDict union is a union of TypedDicts where all variants share a
+common field with distinct literal string types. This pattern is commonly used in libraries like
+pydantic_core for schema definitions.
+
+When a function returns a specific TypedDict variant that is part of a discriminated union, the
+type checker can use the discriminator field to efficiently narrow the union type context. This is
+a significant performance optimization for unions with many variants (like pydantic_core's
+CoreSchema with 50+ TypedDict variants).
+
+```py
+from typing import TypedDict, Literal, Union
+
+class ListSchema(TypedDict):
+    type: Literal['list']
+    items: str
+
+class DictSchema(TypedDict):
+    type: Literal['dict']
+    keys: str
+    values: str
+
+class StringSchema(TypedDict):
+    type: Literal['string']
+    min_length: int
+
+Schema = Union[ListSchema, DictSchema, StringSchema]
+
+def list_schema(items: str) -> ListSchema:
+    return {"type": "list", "items": items}
+
+def dict_schema(keys: str, values: str) -> DictSchema:
+    return {"type": "dict", "keys": keys, "values": values}
+
+def string_schema(min_length: int) -> StringSchema:
+    return {"type": "string", "min_length": min_length}
+
+# Functions returning specific TypedDict variants are correctly typed
+# even when assigned to the broader union type
+schema1: Schema = list_schema("item")
+schema2: Schema = dict_schema("key", "value")
+schema3: Schema = string_schema(1)
+
+# The variable types are the union type since that's what was annotated
+reveal_type(schema1)  # revealed: ListSchema
+reveal_type(schema2)  # revealed: DictSchema
+reveal_type(schema3)  # revealed: StringSchema
+
+# Nested discriminated unions work efficiently - the inner call's return type
+# uses discriminator-based narrowing to avoid trying all union variants
+nested_schema: Schema = list_schema(string_schema(0)["min_length"].__str__())
+reveal_type(nested_schema)  # revealed: ListSchema
+```
+
 [subtyping section]: https://typing.python.org/en/latest/spec/typeddict.html#subtyping-between-typeddict-types
 [`typeddict`]: https://typing.python.org/en/latest/spec/typeddict.html

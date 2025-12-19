@@ -99,7 +99,8 @@ use crate::types::newtype::NewType;
 use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::{Tuple, TupleLength, TupleSpec, TupleType};
 use crate::types::typed_dict::{
-    TypedDictAssignmentKind, validate_typed_dict_constructor, validate_typed_dict_dict_literal,
+    TypedDictAssignmentKind, detect_typed_dict_discriminator, get_discriminator_value,
+    validate_typed_dict_constructor, validate_typed_dict_dict_literal,
     validate_typed_dict_key_assignment,
 };
 use crate::types::visitor::any_over_type;
@@ -7014,6 +7015,39 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // explosion of inference attempts, and is rarely needed in practice.
             Some(Type::Union(union)) => union.elements(db),
             _ => &[],
+        };
+
+        // For discriminated TypedDict unions, filter narrow_targets to only matching variants.
+        // This is a significant performance optimization for unions like pydantic_core's CoreSchema
+        // which has 50+ TypedDict variants with a common discriminator field.
+        let filtered_targets: Vec<Type<'db>>;
+        let narrow_targets = if narrow_targets.len() >= 2 {
+            if let Some(discriminator) = detect_typed_dict_discriminator(db, narrow_targets) {
+                // Check if the return type is a TypedDict with a known discriminator value
+                let return_ty = bindings.return_type(db);
+                if let Some(typed_dict) = return_ty.as_typed_dict() {
+                    if let Some(value) = get_discriminator_value(db, typed_dict, &discriminator) {
+                        // Filter to only variants matching this discriminator value
+                        if let Some(matching_variants) = discriminator.variants_for_value(value) {
+                            filtered_targets = matching_variants
+                                .iter()
+                                .map(|td| Type::TypedDict(*td))
+                                .collect();
+                            &filtered_targets[..]
+                        } else {
+                            narrow_targets
+                        }
+                    } else {
+                        narrow_targets
+                    }
+                } else {
+                    narrow_targets
+                }
+            } else {
+                narrow_targets
+            }
+        } else {
+            narrow_targets
         };
 
         // We silence diagnostics until we successfully narrow to a specific type.
