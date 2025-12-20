@@ -763,10 +763,9 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 } else {
                     non_matching.push(Type::TypedDict(typed_dict));
                 }
-            } else {
-                // Field doesn't exist in this TypedDict - can't match
-                non_matching.push(Type::TypedDict(typed_dict));
             }
+            // If field doesn't exist, this TypedDict is eliminated by the subscript
+            // access itself (it would raise KeyError), so don't add to either list
         }
 
         // For `==`, return matching variants; for `!=`, return non-matching variants
