@@ -33,6 +33,7 @@ camino = { workspace = true }
 colored = { workspace = true }
 compact_str = { workspace = true }
 drop_bomb = { workspace = true }
+either = { workspace = true }
 get-size2 = { workspace = true, features = ["indexmap", "ordermap"] }
 indexmap = { workspace = true }
 itertools = { workspace = true }

@@ -2019,109 +2019,129 @@ static_assert(is_disjoint_from(TD, dict[str, int]))  # error: [static-assert-err
 static_assert(is_disjoint_from(TD, dict[str, str]))  # error: [static-assert-error]
 ```
 
-## Discriminated TypedDict unions
+## Narrowing tagged unions of `TypedDict`s
 
-A discriminated (or "tagged") TypedDict union is a union of TypedDicts where all variants share a
-common field with distinct literal string types. This pattern is commonly used in libraries like
-pydantic_core for schema definitions.
-
-When a function returns a specific TypedDict variant that is part of a discriminated union, the
-type checker can use the discriminator field to efficiently narrow the union type context. This is
-a significant performance optimization for unions with many variants (like pydantic_core's
-CoreSchema with 50+ TypedDict variants).
-
-```py
-from typing import TypedDict, Literal, Union
-
-class ListSchema(TypedDict):
-    type: Literal['list']
-    items: str
-
-class DictSchema(TypedDict):
-    type: Literal['dict']
-    keys: str
-    values: str
-
-class StringSchema(TypedDict):
-    type: Literal['string']
-    min_length: int
-
-Schema = Union[ListSchema, DictSchema, StringSchema]
-
-def list_schema(items: str) -> ListSchema:
-    return {"type": "list", "items": items}
-
-def dict_schema(keys: str, values: str) -> DictSchema:
-    return {"type": "dict", "keys": keys, "values": values}
-
-def string_schema(min_length: int) -> StringSchema:
-    return {"type": "string", "min_length": min_length}
-
-# Functions returning specific TypedDict variants are correctly typed
-# even when assigned to the broader union type
-schema1: Schema = list_schema("item")
-schema2: Schema = dict_schema("key", "value")
-schema3: Schema = string_schema(1)
-
-# The variable types are the union type since that's what was annotated
-reveal_type(schema1)  # revealed: ListSchema
-reveal_type(schema2)  # revealed: DictSchema
-reveal_type(schema3)  # revealed: StringSchema
-
-# Nested discriminated unions work efficiently - the inner call's return type
-# uses discriminator-based narrowing to avoid trying all union variants
-nested_schema: Schema = list_schema(string_schema(0)["min_length"].__str__())
-reveal_type(nested_schema)  # revealed: ListSchema
-```
-
-## Narrowing TypedDict unions by discriminator field
-
-TypedDict unions can be narrowed based on equality checks against the discriminator field:
+In a tagged union of `TypedDict`s, a common field in each member (often `"type"` or `"tag"`) is
+given a distinct `Literal` type/value. We can narrow the union by constraining this field:
 
 ```py
 from typing import TypedDict, Literal
 
-class ListSchema(TypedDict):
-    type: Literal['list']
-    items: str
+class Foo(TypedDict):
+    tag: Literal["foo"]
 
-class DictSchema(TypedDict):
-    type: Literal['dict']
-    keys: str
-    values: str
+class Bar(TypedDict):
+    tag: Literal[42]
 
-class StringSchema(TypedDict):
-    type: Literal['string']
-    min_length: int
+class Baz(TypedDict):
+    tag: Literal["baz"]
 
-def process_schema(schema: ListSchema | DictSchema | StringSchema) -> str:
-    if schema["type"] == "list":
-        reveal_type(schema)  # revealed: ListSchema
-        return schema["items"]
-    elif schema["type"] == "dict":
-        reveal_type(schema)  # revealed: DictSchema
-        return schema["keys"]
+def _(u: Foo | Bar | Baz):
+    if u["tag"] == "foo":
+        reveal_type(u)  # revealed: Foo
+    elif u["tag"] == 42:
+        reveal_type(u)  # revealed: Bar
     else:
-        reveal_type(schema)  # revealed: StringSchema
-        return str(schema["min_length"])
+        reveal_type(u)  # revealed: Baz
 ```
 
-Negated comparisons also work:
+We can descend into intersections to discover `TypedDict` types that need narrowing:
 
 ```py
-def process_not_list(schema: ListSchema | DictSchema | StringSchema) -> str:
-    if schema["type"] != "list":
-        reveal_type(schema)  # revealed: DictSchema | StringSchema
-        if schema["type"] == "dict":
-            reveal_type(schema)  # revealed: DictSchema
-            return schema["keys"]
-        else:
-            reveal_type(schema)  # revealed: StringSchema
-            return str(schema["min_length"])
+from collections.abc import Mapping
+from ty_extensions import Intersection
+
+def _(u: Foo | Intersection[Bar, Mapping[str, int]]):
+    if u["tag"] == "foo":
+        reveal_type(u)  # revealed: Foo
     else:
-        reveal_type(schema)  # revealed: ListSchema
-        return schema["items"]
+        reveal_type(u)  # revealed: Bar & Mapping[str, int]
 ```
 
+We can also narrow a single `TypedDict` type to `Never`:
+
+```py
+def _(u: Foo):
+    if u["tag"] == "foo":
+        reveal_type(u)  # revealed: Foo
+    else:
+        reveal_type(u)  # revealed: Never
+```
+
+Narrowing is restricted to `Literal` tags, though, because `x == "foo"` doesn't generally tell us
+anything about the type of `x`. Here's an example where narrowing would be tempting but unsound:
+
+```py
+from ty_extensions import is_assignable_to, static_assert
+
+class NonLiteralTD(TypedDict):
+    tag: int
+
+def _(u: Foo | NonLiteralTD):
+    if u["tag"] == "foo":
+        # We can't narrow the union here...
+        reveal_type(u)  # revealed: Foo | NonLiteralTD
+    else:
+        # ...(even though we can here)...
+        reveal_type(u)  # revealed: NonLiteralTD
+
+# ...because `NonLiteralTD["tag"]` could be assigned to with one of these, which would make the
+# first condition above true at runtime!
+class WackyInt(int):
+    def __eq__(self, other):
+        return True
+
+_: NonLiteralTD = {"tag": WackyInt(99)}  # allowed
+```
+
+We can still narrow `Literal` tags even when non-`TypedDict` types are present in the union:
+
+```py
+def _(u: Foo | Bar | dict):
+    if u["tag"] == "foo":
+        # TODO: `dict & ~Bar` should simplify to `dict` here, but that's currently a false negative
+        # in `is_disjoint_impl`.
+        reveal_type(u)  # revealed: Foo | (dict[Unknown, Unknown] & ~Bar)
+
+# The negation(s) will simplify out if we add something to the union that doesn't inherit from
+# `dict`. It just needs to support indexing with a string key.
+class NotADict:
+    def __getitem__(self, key): ...
+
+def _(u: Foo | Bar | NotADict):
+    if u["tag"] == 42:
+        reveal_type(u)  # revealed: Bar | NotADict
+```
+
+It would be nice if we could also narrow `TypedDict` unions by checking whether a key (which only
+shows up in a subset of the union members) is present, but that isn't generally correct, because
+"extra items" are allowed by default. For example, even though `Bar` here doesn't define a `"foo"`
+field, it could be *assigned to* with another `TypedDict` that does:
+
+```py
+class Foo(TypedDict):
+    foo: int
+
+class Bar(TypedDict):
+    bar: int
+
+def disappointment(u: Foo | Bar):
+    if "foo" in u:
+        # We can't narrow the union here...
+        reveal_type(u)  # revealed: Foo | Bar
+
+# ...because `u` could turn out to be one of these.
+class FooBar(TypedDict):
+    foo: int
+    bar: int
+
+static_assert(is_assignable_to(FooBar, Foo))
+static_assert(is_assignable_to(FooBar, Bar))
+```
+
+TODO: The narrowing that we didn't do above will become possible when we add support for
+`closed=True`. This is [one of the main use cases][closed] that motivated the `closed` feature.
+
+[closed]: https://peps.python.org/pep-0728/#disallowing-extra-items-explicitly
 [subtyping section]: https://typing.python.org/en/latest/spec/typeddict.html#subtyping-between-typeddict-types
 [`typeddict`]: https://typing.python.org/en/latest/spec/typeddict.html

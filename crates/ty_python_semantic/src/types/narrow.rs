@@ -12,21 +12,21 @@ use crate::types::function::KnownFunction;
 use crate::types::infer::infer_same_file_expression_type;
 use crate::types::typed_dict::TypedDictType;
 use crate::types::{
-    CallableType, ClassLiteral, ClassType, IntersectionBuilder, KnownClass, KnownInstanceType,
-    SpecialFormType, SubclassOfInner, SubclassOfType, Truthiness, Type, TypeContext,
-    TypeVarBoundOrConstraints, UnionBuilder, infer_expression_types,
+    CallableType, ClassLiteral, ClassType, IntersectionBuilder, IntersectionType, KnownClass,
+    KnownInstanceType, SpecialFormType, SubclassOfInner, SubclassOfType, Truthiness, Type,
+    TypeContext, TypeVarBoundOrConstraints, UnionBuilder, UnionType, infer_expression_types,
 };
 
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
+use ruff_python_ast::name::Name;
 use ruff_python_stdlib::identifiers::is_identifier;
 
+use either::Either::{Left, Right};
 use itertools::Itertools;
 use ruff_python_ast as ast;
 use ruff_python_ast::{BoolOp, ExprBoolOp};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-
-use super::UnionType;
 
 /// Return the type constraint that `test` (if true) would place on `symbol`, if any.
 ///
@@ -701,86 +701,6 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         }
     }
 
-    /// Narrow a `TypedDict` union based on a subscript comparison.
-    ///
-    /// For `td["x"] == "foo"` where `td` is a `TypedDict` union, this narrows `td` to only
-    /// the `TypedDict` variants where field "x" could match "foo".
-    fn narrow_typed_dict_by_subscript_comparison(
-        &self,
-        base: &ast::Expr,
-        slice: &ast::Expr,
-        rhs_ty: Type<'db>,
-        op: ast::CmpOp,
-        is_positive: bool,
-        inference: &super::infer::ExpressionInference<'db>,
-    ) -> Option<Type<'db>> {
-        use ruff_python_ast::name::Name;
-
-        // Only handle == and != comparisons
-        let is_eq = match op {
-            ast::CmpOp::Eq => is_positive,
-            ast::CmpOp::NotEq => !is_positive,
-            _ => return None,
-        };
-
-        // Get the key being accessed - must be a string literal
-        let key = match slice {
-            ast::Expr::StringLiteral(lit) => Name::new(lit.value.to_str()),
-            _ => return None,
-        };
-
-        // Get the base type
-        let base_ty = inference.expression_type(base);
-
-        // Extract TypedDict types from the base (handle both single TypedDict and unions)
-        let typed_dicts: Vec<TypedDictType<'db>> = match base_ty {
-            Type::Union(union) => union
-                .elements(self.db)
-                .iter()
-                .filter_map(|ty| ty.as_typed_dict())
-                .collect(),
-            Type::TypedDict(td) => vec![td],
-            _ => return None,
-        };
-
-        // If no TypedDicts, nothing to narrow
-        if typed_dicts.is_empty() {
-            return None;
-        }
-
-        // Filter TypedDicts based on whether their field could match rhs_ty
-        let mut matching: Vec<Type<'db>> = Vec::new();
-        let mut non_matching: Vec<Type<'db>> = Vec::new();
-
-        for typed_dict in typed_dicts {
-            let items = typed_dict.items(self.db);
-            if let Some(field) = items.get(&key) {
-                let field_ty = field.declared_ty;
-                // Check if the field type could match the RHS
-                let could_match = !field_ty.is_disjoint_from(self.db, rhs_ty);
-                if could_match {
-                    matching.push(Type::TypedDict(typed_dict));
-                } else {
-                    non_matching.push(Type::TypedDict(typed_dict));
-                }
-            }
-            // If field doesn't exist, this TypedDict is eliminated by the subscript
-            // access itself (it would raise KeyError), so don't add to either list
-        }
-
-        // For `==`, return matching variants; for `!=`, return non-matching variants
-        let result_types = if is_eq { matching } else { non_matching };
-
-        if result_types.is_empty() {
-            // If nothing matches, don't narrow (return None to keep original type)
-            None
-        } else if result_types.len() == 1 {
-            Some(result_types.into_iter().next().unwrap())
-        } else {
-            Some(UnionType::from_elements(self.db, result_types))
-        }
-    }
-
     // TODO `expr_in` and `expr_not_in` should perhaps be unified with `expr_eq` and `expr_ne`,
     // since `eq` and `ne` are equivalent to `in` and `not in` with only one element in the RHS.
     fn evaluate_expr_in(&mut self, lhs_ty: Type<'db>, rhs_ty: Type<'db>) -> Option<Type<'db>> {
@@ -949,6 +869,78 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             .tuple_windows::<(&ruff_python_ast::Expr, &ruff_python_ast::Expr)>();
         let mut constraints = NarrowingConstraints::default();
 
+        // Narrow tagged unions of `TypedDict`s with `Literal` keys, for example:
+        //
+        //     class Foo(TypedDict):
+        //         tag: Literal["foo"]
+        //     class Bar(TypedDict):
+        //         tag: Literal["bar"]
+        //     def _(union: Foo | Bar):
+        //         if union["tag"] == "foo":
+        //             reveal_type(union)  # Foo
+        //
+        // Importantly, `my_typeddict_union["tag"]` isn't the place we're going to constraint.
+        // Instead, we're going to constrain `my_typeddict_union` itself.
+        if ops.len() == 1
+            && ops[0] == ast::CmpOp::Eq
+            && let ast::Expr::Subscript(subscript) = &**left
+            && let lhs_value_type = inference.expression_type(&*subscript.value)
+            // Checking for `TypedDict`s up front isn't strictly necessary, since the iterator
+            // below will yield nothing if it doesn't find any, but we want to do as little work as
+            // possible in the common case.
+            && is_typeddict_or_union_with_typeddicts(lhs_value_type, self.db)
+            && let Some(subscript_place_expr) = place_expr(&subscript.value)
+            && let Some(key_literal) = inference
+                .expression_type(&*subscript.slice)
+                .as_string_literal()
+        {
+            let field_name = Name::from(key_literal.value(self.db));
+            let rhs_type = inference.expression_type(&comparators[0]);
+
+            // Performance optimization: for simple unions of TypedDicts (no other types,
+            // no intersections), use direct filtering instead of intersection-based narrowing.
+            // This is O(n) instead of O(n²) for the intersection simplification.
+            if let Some(narrowed) = self.narrow_typed_dict_union_fast(
+                lhs_value_type,
+                &field_name,
+                rhs_type,
+                is_positive,
+            ) {
+                let place = self.expect_place(&subscript_place_expr);
+                constraints.insert(place, narrowed);
+            } else {
+                // Fall back to intersection-based narrowing for complex cases
+                // (unions with non-TypedDicts, intersections, etc.)
+                let mut intersection = IntersectionBuilder::new(self.db);
+                // This iterator handles individual `TypedDict`, unions, intersections (the positive
+                // members), and unions of intersections.
+                for typed_dict_type in all_typeddicts_within_type_iter(lhs_value_type, self.db) {
+                    if let Some(field) = typed_dict_type.items(self.db).get(&field_name) {
+                        let known_equality_result = match (field.declared_ty, rhs_type) {
+                            (Type::StringLiteral(lhs), Type::StringLiteral(rhs)) => Some(lhs == rhs),
+                            (Type::IntLiteral(lhs), Type::IntLiteral(rhs)) => Some(lhs == rhs),
+                            // It's unlikely that the user will mix int and string literals in the same
+                            // union, but go ahead and handle it.
+                            (Type::StringLiteral(_), Type::IntLiteral(_))
+                            | (Type::IntLiteral(_), Type::StringLiteral(_)) => Some(false),
+                            _ => None,
+                        };
+                        if let Some(equality) = known_equality_result
+                            && equality != is_positive
+                        {
+                            // We could synthesize a `TypedDict` with just this one specific field, but
+                            // using the caller's own named types makes the resulting intersections
+                            // easier to read, in the cases where they don't simplify out.
+                            intersection =
+                                intersection.add_negative(Type::TypedDict(typed_dict_type));
+                        }
+                    }
+                }
+                let place = self.expect_place(&subscript_place_expr);
+                constraints.insert(place, intersection.build());
+            }
+        }
+
         let mut last_rhs_ty: Option<Type> = None;
 
         for (op, (left, right)) in std::iter::zip(&**ops, comparator_tuples) {
@@ -957,40 +949,16 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             last_rhs_ty = Some(rhs_ty);
 
             match left {
-                ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Named(_) => {
+                ast::Expr::Name(_)
+                | ast::Expr::Attribute(_)
+                | ast::Expr::Subscript(_)
+                | ast::Expr::Named(_) => {
                     if let Some(left) = place_expr(left)
                         && let Some(ty) =
                             self.evaluate_expr_compare_op(lhs_ty, rhs_ty, *op, is_positive)
                     {
                         let place = self.expect_place(&left);
                         constraints.insert(place, ty);
-                    }
-                }
-                ast::Expr::Subscript(subscript) => {
-                    // Handle regular subscript narrowing
-                    if let Some(left) = place_expr(left)
-                        && let Some(ty) =
-                            self.evaluate_expr_compare_op(lhs_ty, rhs_ty, *op, is_positive)
-                    {
-                        let place = self.expect_place(&left);
-                        constraints.insert(place, ty);
-                    }
-
-                    // Also narrow the base of the subscript for TypedDict unions
-                    // e.g., for `td["x"] == "foo"`, narrow `td` to only TypedDict variants
-                    // where field "x" could match "foo"
-                    if let Some(narrowed_base) = self.narrow_typed_dict_by_subscript_comparison(
-                        &subscript.value,
-                        &subscript.slice,
-                        rhs_ty,
-                        *op,
-                        is_positive,
-                        inference,
-                    ) {
-                        if let Some(base_place) = place_expr(&subscript.value) {
-                            let place = self.expect_place(&base_place);
-                            constraints.insert(place, narrowed_base);
-                        }
                     }
                 }
                 ast::Expr::Call(ast::ExprCall {
@@ -1306,5 +1274,153 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 first.clone()
             }
         }
+    }
+
+    /// Fast path for narrowing simple TypedDict unions (pure unions with no intersections
+    /// or non-TypedDict members). Returns `None` if the type is too complex for this
+    /// optimization and we should fall back to intersection-based narrowing.
+    ///
+    /// This is O(n) instead of O(n²) for the intersection simplification approach.
+    fn narrow_typed_dict_union_fast(
+        &self,
+        ty: Type<'db>,
+        field_name: &Name,
+        rhs_type: Type<'db>,
+        is_positive: bool,
+    ) -> Option<Type<'db>> {
+        // Only handle simple unions of TypedDicts
+        let typed_dicts: Vec<TypedDictType<'db>> = match ty {
+            Type::TypedDict(td) => vec![td],
+            Type::Union(union) => {
+                let mut tds = Vec::new();
+                for elem in union.elements(self.db) {
+                    match elem {
+                        Type::TypedDict(td) => tds.push(*td),
+                        // Complex case: union contains non-TypedDict or intersection
+                        _ => return None,
+                    }
+                }
+                tds
+            }
+            // Complex case: intersection or other type
+            _ => return None,
+        };
+
+        // Filter TypedDicts based on whether their field matches rhs_type
+        let mut matching: Vec<Type<'db>> = Vec::new();
+        let mut non_matching: Vec<Type<'db>> = Vec::new();
+
+        for typed_dict in typed_dicts {
+            if let Some(field) = typed_dict.items(self.db).get(field_name) {
+                let known_equality_result = match (field.declared_ty, rhs_type) {
+                    (Type::StringLiteral(lhs), Type::StringLiteral(rhs)) => Some(lhs == rhs),
+                    (Type::IntLiteral(lhs), Type::IntLiteral(rhs)) => Some(lhs == rhs),
+                    (Type::StringLiteral(_), Type::IntLiteral(_))
+                    | (Type::IntLiteral(_), Type::StringLiteral(_)) => Some(false),
+                    // Non-literal field type - fall back to intersection approach
+                    _ => return None,
+                };
+
+                match known_equality_result {
+                    Some(true) => matching.push(Type::TypedDict(typed_dict)),
+                    Some(false) => non_matching.push(Type::TypedDict(typed_dict)),
+                    None => return None,
+                }
+            }
+            // If field doesn't exist, this TypedDict is eliminated by the subscript
+            // access itself (it would raise KeyError), so don't add to either list
+        }
+
+        // For `==` (is_positive=true), return matching variants
+        // For `!=` (is_positive=false), return non-matching variants
+        let result = if is_positive { matching } else { non_matching };
+
+        if result.is_empty() {
+            Some(Type::Never)
+        } else {
+            Some(UnionType::from_elements(self.db, result))
+        }
+    }
+}
+
+// Return true if the given type is a `TypedDict`, or if it's a union that includes at least one
+// `TypedDict` (even if other types are present).
+fn is_typeddict_or_union_with_typeddicts<'db>(ty: Type<'db>, db: &'db dyn Db) -> bool {
+    match ty {
+        Type::TypedDict(_) => true,
+        Type::Union(union) => {
+            union
+                .elements(db)
+                .iter()
+                .any(|union_member_ty| match union_member_ty {
+                    Type::TypedDict(_) => true,
+                    Type::Intersection(intersection) => {
+                        intersection
+                            .positive(db)
+                            .iter()
+                            .any(|intersection_member_ty| {
+                                matches!(intersection_member_ty, Type::TypedDict(_))
+                            })
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// If this is a `TypedDict`, return an iterator that yields it. Or if this is a union/intersection
+/// that includes any `TypedDict`s, return an iterator that yields them (and ignores any
+/// non-`TypedDict` members). Otherwise, return an empty iterator.
+fn all_typeddicts_within_type_iter<'db>(
+    ty: Type<'db>,
+    db: &'db dyn Db,
+) -> impl Iterator<Item = TypedDictType<'db>> {
+    // It would be much easier to implement this with generators. As it is, if we want to collect
+    // everything without allocating a `Vec` or boxing the iterators, we need to do a lot of
+    // `Some/None/Either::{Left, Right}` wrapping. This lets the compiler deduce a single concrete
+    // `Iterator` type at each step, instead of a mishmash of types depending on what we find in
+    // these loop-matches. The trick that makes this work is that `Either` implements `Iterator` as
+    // long as both the left and right sides do.
+
+    // Unions are guaranteed to be DNF, so we don't need to consider unions within intersections.
+    fn typeddicts_in_intersection<'db>(
+        intersection: IntersectionType<'db>,
+        db: &'db dyn Db,
+    ) -> impl Iterator<Item = TypedDictType<'db>> {
+        // Yield all the *positive* `TypedDicts` in this intersection.
+        intersection.positive(db).iter().filter_map(|ty| match ty {
+            Type::TypedDict(typed_dict_type) => Some(*typed_dict_type),
+            _ => None,
+        })
+    }
+
+    // But we do need to consider intersections within unions.
+    fn typeddicts_in_union<'db>(
+        union: UnionType<'db>,
+        db: &'db dyn Db,
+    ) -> impl Iterator<Item = TypedDictType<'db>> {
+        union
+            .elements(db)
+            .iter()
+            // Yield all the top-level `TypedDict`s in this union, and also descend into any
+            // intersections.
+            .filter_map(|ty| match ty {
+                Type::TypedDict(typed_dict_type) => Some(Left(std::iter::once(*typed_dict_type))),
+                Type::Intersection(intersection) => {
+                    Some(Right(typeddicts_in_intersection(*intersection, db)))
+                }
+                _ => None,
+            })
+            .flatten()
+    }
+
+    match ty {
+        Type::TypedDict(typed_dict_type) => Left(Left(std::iter::once(typed_dict_type))),
+        Type::Union(union) => Left(Right(typeddicts_in_union(union, db))),
+        Type::Intersection(intersection) => {
+            Right(Left(typeddicts_in_intersection(intersection, db)))
+        }
+        _ => Right(Right(std::iter::empty())),
     }
 }
