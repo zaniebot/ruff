@@ -2124,7 +2124,9 @@ fn ty_environment_and_active_environment() -> anyhow::Result<()> {
 }
 
 /// When ty is installed in a system environment rather than a virtual environment, it should
-/// not include the environment's site-packages in its search path.
+/// include the environment's site-packages in its search path.
+///
+/// See: https://github.com/astral-sh/ty/issues/1733
 #[test]
 fn ty_environment_is_system_not_virtual() -> anyhow::Result<()> {
     let ty_system_site_packages = if cfg!(windows) {
@@ -2142,7 +2144,7 @@ fn ty_environment_is_system_not_virtual() -> anyhow::Result<()> {
     let ty_package_path = format!("{ty_system_site_packages}/system_package/__init__.py");
 
     let case = CliTest::with_files([
-        // Package in system Python installation (should NOT be discovered)
+        // Package in system Python installation (should be discovered)
         (ty_package_path.as_str(), "class SystemClass: ..."),
         // Note: NO pyvenv.cfg - this is a system installation, not a venv
         (
@@ -2155,22 +2157,10 @@ fn ty_environment_is_system_not_virtual() -> anyhow::Result<()> {
     .with_ty_at(ty_executable_path)?;
 
     assert_cmd_snapshot!(case.command(), @r###"
-    success: false
-    exit_code: 1
+    success: true
+    exit_code: 0
     ----- stdout -----
-    error[unresolved-import]: Cannot resolve imported module `system_package`
-     --> test.py:2:6
-      |
-    2 | from system_package import SystemClass
-      |      ^^^^^^^^^^^^^^
-      |
-    info: Searched in the following paths during module resolution:
-    info:   1. <temp_dir>/ (first-party code)
-    info:   2. vendored://stdlib (stdlib typeshed stubs vendored by ty)
-    info: make sure your Python environment is properly configured: https://docs.astral.sh/ty/modules/#python-environment
-    info: rule `unresolved-import` is enabled by default
-
-    Found 1 diagnostic
+    All checks passed!
 
     ----- stderr -----
     "###);
@@ -2748,6 +2738,47 @@ home = ./
       Cause: Invalid `VIRTUAL_ENV` environment variable `<temp_dir>/nonexistent-venv`: does not point to a directory on disk
       Cause: No such file or directory (os error 2)
     ");
+
+    Ok(())
+}
+
+/// Test behavior when `VIRTUAL_ENV` is set but points to a system environment
+/// without a `pyvenv.cfg` file. This can happen when using `UV_PROJECT_ENVIRONMENT`
+/// to point to a non-virtual environment like `/usr/local`.
+///
+/// See: https://github.com/astral-sh/ty/issues/1733
+#[test]
+fn virtual_env_without_pyvenv_cfg() -> anyhow::Result<()> {
+    let system_site_packages = if cfg!(windows) {
+        "system-python/Lib/site-packages"
+    } else {
+        "system-python/lib/python3.13/site-packages"
+    };
+
+    let package_path = format!("{system_site_packages}/mypackage/__init__.py");
+
+    let case = CliTest::with_files([
+        (
+            "test.py",
+            r#"
+            from mypackage import MyClass
+            "#,
+        ),
+        // System environment with site-packages but NO pyvenv.cfg
+        (package_path.as_str(), "class MyClass: ..."),
+    ])?;
+
+    // Setting VIRTUAL_ENV to a directory without pyvenv.cfg should fall back
+    // to treating it as a system environment and still discover site-packages
+    assert_cmd_snapshot!(case.command()
+        .env("VIRTUAL_ENV", case.root().join("system-python")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    All checks passed!
+
+    ----- stderr -----
+    "###);
 
     Ok(())
 }

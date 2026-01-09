@@ -1611,19 +1611,18 @@ impl SysPrefixPathOrigin {
     /// Python environment).
     pub(crate) const fn must_be_virtual_env(&self) -> bool {
         match self {
-            Self::LocalVenv | Self::VirtualEnvVar => true,
-            Self::ConfigFileSetting(..)
+            Self::LocalVenv => true,
+            // `VIRTUAL_ENV` can point to a system environment (e.g., when using
+            // `UV_PROJECT_ENVIRONMENT=/usr/local`), so we allow fallback to system environment
+            // if no `pyvenv.cfg` file is found.
+            // Similarly, ty itself could be installed in a system Python environment.
+            Self::VirtualEnvVar
+            | Self::SelfEnvironment
+            | Self::ConfigFileSetting(..)
             | Self::PythonCliFlag
             | Self::Editor
             | Self::DerivedFromPyvenvCfg
             | Self::CondaPrefixVar => false,
-            // It's not strictly true that the self environment must be virtual, e.g., ty could be
-            // installed in a system Python environment and users may expect us to respect
-            // dependencies installed alongside it. However, we're intentionally excluding support
-            // for this to start. Note a change here has downstream implications, i.e., we probably
-            // don't want the packages in a system environment to take precedence over those in a
-            // virtual environment and would need to reverse the ordering in that case.
-            Self::SelfEnvironment => true,
         }
     }
 
@@ -2062,7 +2061,11 @@ mod tests {
     }
 
     #[test]
-    fn cannot_find_site_packages_directory_no_virtual_env_at_origin_virtual_env_var() {
+    fn can_find_site_packages_directory_no_pyvenv_cfg_at_origin_virtual_env_var() {
+        // When VIRTUAL_ENV points to a directory without pyvenv.cfg,
+        // we fall back to treating it as a system environment.
+        // This supports use cases like `UV_PROJECT_ENVIRONMENT=/usr/local`.
+        // See: https://github.com/astral-sh/ty/issues/1733
         let test = PythonEnvironmentTestCase {
             system: TestSystem::default(),
             minor_version: 13,
@@ -2070,11 +2073,7 @@ mod tests {
             origin: SysPrefixPathOrigin::VirtualEnvVar,
             virtual_env: None,
         };
-        let err = test.err();
-        assert!(
-            matches!(err, SitePackagesDiscoveryError::NoPyvenvCfgFile(..)),
-            "Got {err:?}",
-        );
+        test.run();
     }
 
     #[test]
