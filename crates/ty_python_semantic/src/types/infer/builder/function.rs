@@ -14,12 +14,12 @@ use crate::{
             ABSTRACT_AND_FINAL_METHOD, ASSERT_TYPE_UNSPELLABLE_SUBTYPE, DISJOINT_CAST,
             FINAL_ON_NON_METHOD, INVALID_ARGUMENT_TYPE, INVALID_PARAMETER_DEFAULT,
             INVALID_PARAMSPEC, INVALID_TYPE_FORM, REDUNDANT_CAST, STATIC_ASSERT_ERROR,
-            TYPE_ASSERTION_FAILURE, UNSOUND_RETURN_STATEMENT, USELESS_OVERLOAD_BODY,
-            add_type_expression_reference_link, is_invalid_typed_dict_literal,
-            report_bad_argument_to_get_protocol_members, report_bad_argument_to_protocol_interface,
-            report_implicit_return_type, report_invalid_generator_function_return_type,
-            report_invalid_return_type, report_invalid_runtime_checkable,
-            report_invalid_total_ordering_call,
+            TYPE_ASSERTION_FAILURE, UNANNOTATED_PARAMETER, UNSOUND_RETURN_STATEMENT,
+            USELESS_OVERLOAD_BODY, add_type_expression_reference_link,
+            is_invalid_typed_dict_literal, report_bad_argument_to_get_protocol_members,
+            report_bad_argument_to_protocol_interface, report_implicit_return_type,
+            report_invalid_generator_function_return_type, report_invalid_return_type,
+            report_invalid_runtime_checkable, report_invalid_total_ordering_call,
             report_issubclass_check_against_protocol_with_non_method_members,
             report_runtime_check_against_non_runtime_checkable_protocol,
             report_runtime_check_against_typed_dict, report_shadowed_type_variable,
@@ -530,6 +530,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             ));
         }
 
+        self.check_parameter_annotations(function, definition);
+
         // If there are type params, parameters and returns are evaluated in that scope. Otherwise,
         // we defer the inference of any parameter and return annotations. That ensures that we do
         // not add any spurious salsa cycles when applying decorators below. (Applying a decorator
@@ -858,6 +860,31 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.context
                 .inference_flags
                 .remove(InferenceFlags::IN_RETURN_TYPE);
+        }
+    }
+
+    fn check_parameter_annotations(
+        &self,
+        function: &ast::StmtFunctionDef,
+        definition: Definition<'db>,
+    ) {
+        if !self.context.is_lint_enabled(&UNANNOTATED_PARAMETER) {
+            return;
+        }
+        let parameters = &function.parameters;
+        let has_receiver = (!parameters.posonlyargs.is_empty() || !parameters.args.is_empty())
+            && MethodReceiverKind::from_function(self.db(), definition, function).is_some();
+        for parameter in parameters.iter().skip(usize::from(has_receiver)) {
+            if parameter.annotation().is_none()
+                && let Some(builder) = self
+                    .context
+                    .report_lint(&UNANNOTATED_PARAMETER, parameter.name())
+            {
+                builder.into_diagnostic(format_args!(
+                    "Parameter `{}` has no type annotation",
+                    parameter.name()
+                ));
+            }
         }
     }
 

@@ -78,6 +78,70 @@ def g(*args, **kwargs):
     reveal_type(kwargs)  # revealed: dict[str, Unknown]
 ```
 
+## Reporting unannotated parameters
+
+```toml
+[rules]
+unannotated-parameter = "error"
+```
+
+A default value does not constrain the type that a caller can pass.
+
+```py
+# snapshot: unannotated-parameter
+def double(value=0):
+    return value * 2
+```
+
+```snapshot
+error[unannotated-parameter]: Parameter `value` has no type annotation
+ --> src/mdtest_snippet.py:2:12
+  |
+2 | def double(value=0):
+  |            ^^^^^
+```
+
+The rule applies to positional-only, keyword-only, and variadic parameters.
+
+```py
+def collect(
+    first,  # error: [unannotated-parameter]
+    /,
+    *args,  # error: [unannotated-parameter]
+    required,  # error: [unannotated-parameter]
+    **kwargs,  # error: [unannotated-parameter]
+):
+    pass
+```
+
+ty infers the type of a method receiver regardless of its name. A static method has no receiver.
+
+```py
+from typing import Any
+
+class Example:
+    def method(this, /, value: Any):  # no diagnostic
+        pass
+
+    @classmethod
+    def create(klass):  # no diagnostic
+        return klass()
+
+    @staticmethod
+    def convert(self):  # error: [unannotated-parameter]
+        pass
+```
+
+`@no_type_check` suppresses the rule for the decorated function.
+
+```py
+from typing import no_type_check
+
+@no_type_check
+def unchecked(value):  # no diagnostic
+    pass
+```
+
 ## Annotation is present but not a fully static type
 
 If there is an annotation, we respect it fully and don't union in the default value type.

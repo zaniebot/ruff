@@ -2,6 +2,129 @@ use insta_cmd::assert_cmd_snapshot;
 
 use crate::CliTest;
 
+#[test]
+fn strict_preset() -> anyhow::Result<()> {
+    let case = CliTest::with_file(
+        "example.py",
+        r#"
+        def process(value, items: list):
+            pass
+
+        class Base:
+            def run(self): pass
+
+        class Child(Base):
+            def run(self): pass
+
+        x = 1  # ty: ignore[invalid-assignment]
+        y = 2  # type: ignore
+        z = 1 / 0
+        "#,
+    )?;
+
+    assert_cmd_snapshot!(case.command().args(["--output-format", "concise"]), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    example.py:11:8: warning[unused-ignore-comment] Unused `ty: ignore` directive
+    example.py:12:8: warning[unused-type-ignore-comment] Unused blanket `type: ignore` directive
+    Found 2 diagnostics
+
+    ----- stderr -----
+    ");
+    assert_cmd_snapshot!(case.command().args(["--strict", "--output-format", "concise"]), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    example.py:2:13: error[unannotated-parameter] Parameter `value` has no type annotation
+    example.py:2:27: error[missing-type-argument] Missing type argument for generic class `list` (expected 1 type argument)
+    example.py:9:9: error[missing-override-decorator] Method `run` overrides `Base.run` but is not decorated with `@override`
+    example.py:11:8: error[unused-ignore-comment] Unused `ty: ignore` directive
+    example.py:12:8: error[unused-type-ignore-comment] Unused blanket `type: ignore` directive
+    Found 5 diagnostics
+
+    ----- stderr -----
+    ");
+
+    case.write_file(
+        "pyproject.toml",
+        r#"
+        [tool.ty]
+        preset = "strict"
+        [tool.ty.rules]
+        unannotated-parameter = "ignore"
+    "#,
+    )?;
+    assert_cmd_snapshot!(case.command().args(["--output-format", "concise", "--warn", "missing-type-argument"]), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    example.py:2:27: warning[missing-type-argument] Missing type argument for generic class `list` (expected 1 type argument)
+    example.py:9:9: error[missing-override-decorator] Method `run` overrides `Base.run` but is not decorated with `@override`
+    example.py:11:8: error[unused-ignore-comment] Unused `ty: ignore` directive
+    example.py:12:8: error[unused-type-ignore-comment] Unused blanket `type: ignore` directive
+    Found 4 diagnostics
+
+    ----- stderr -----
+    ");
+    assert_cmd_snapshot!(case.command().args(["--preset", "default", "--output-format", "concise"]), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    example.py:11:8: warning[unused-ignore-comment] Unused `ty: ignore` directive
+    example.py:12:8: warning[unused-type-ignore-comment] Unused blanket `type: ignore` directive
+    Found 2 diagnostics
+
+    ----- stderr -----
+    ");
+    assert_cmd_snapshot!(case.command().args(["--strict", "--ignore", "all"]), @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    All checks passed!
+
+    ----- stderr -----
+    ");
+    Ok(())
+}
+
+#[test]
+fn strict_preset_with_overrides() -> anyhow::Result<()> {
+    let source = "def process(value, items: list): pass";
+    let case = CliTest::with_files([
+        ("one.py", source),
+        ("two.py", source),
+        (
+            "ty.toml",
+            r#"
+            preset = "strict"
+
+            [[overrides]]
+            include = ["one.py", "two.py"]
+            [overrides.rules]
+            unannotated-parameter = "warn"
+
+            [[overrides]]
+            include = ["two.py"]
+            [overrides.rules]
+            unannotated-parameter = "ignore"
+        "#,
+        ),
+    ])?;
+    assert_cmd_snapshot!(case.command().args(["--output-format", "concise"]), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    one.py:1:13: warning[unannotated-parameter] Parameter `value` has no type annotation
+    one.py:1:27: error[missing-type-argument] Missing type argument for generic class `list` (expected 1 type argument)
+    two.py:1:27: error[missing-type-argument] Missing type argument for generic class `list` (expected 1 type argument)
+    Found 3 diagnostics
+
+    ----- stderr -----
+    ");
+    Ok(())
+}
+
 /// The rule severity can be changed in the configuration file
 #[test]
 fn configuration_rule_severity() -> anyhow::Result<()> {

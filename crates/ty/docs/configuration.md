@@ -30,6 +30,38 @@ Diagnostic baselines are in preview. The file format may change between ty relea
 
 ---
 
+## `preset`
+
+Selects the project-wide base set of rule severities.
+
+The `default` preset uses each rule's default severity. The `strict` preset
+additionally reports `unannotated-parameter`, `missing-type-argument`,
+`missing-override-decorator`, `unused-ignore-comment`, and
+`unused-type-ignore-comment` as errors.
+
+Explicit rule settings, including per-file overrides, take precedence over the preset.
+
+**Default value**: `"default"`
+
+**Type**: `"default" | "strict"`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.ty]
+    preset = "strict"
+    ```
+
+=== "ty.toml"
+
+    ```toml
+    preset = "strict"
+    ```
+
+---
+
 ## `rules`
 
 Configures the enabled rules and their severity.

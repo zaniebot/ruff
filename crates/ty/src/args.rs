@@ -7,7 +7,9 @@ use clap::{ArgAction, ArgMatches, Error, Parser};
 use ruff_db::system::SystemPathBuf;
 use ruff_ranged_value::{RangedValue, ValueSource};
 use ty_combine::Combine;
-use ty_project::metadata::options::{EnvironmentOptions, Options, SrcOptions, TerminalOptions};
+use ty_project::metadata::options::{
+    EnvironmentOptions, Options, RulePreset, SrcOptions, TerminalOptions,
+};
 use ty_project::metadata::value::{RelativeGlobPattern, RelativePathBuf};
 use ty_python_semantic::lint;
 use ty_static::EnvVars;
@@ -153,6 +155,18 @@ pub(crate) struct CheckCommand {
     #[clap(flatten)]
     rules: RulesArg,
 
+    /// Select the base set of rule severities.
+    #[arg(long, value_enum, help_heading = "Enabling / disabling rules")]
+    preset: Option<PresetArg>,
+
+    /// Use the strict rule preset (equivalent to `--preset strict`).
+    #[arg(
+        long,
+        help_heading = "Enabling / disabling rules",
+        conflicts_with = "preset"
+    )]
+    strict: bool,
+
     #[clap(flatten)]
     config: ConfigsArg,
 
@@ -282,6 +296,10 @@ impl CheckCommand {
             .or(self.error_on_warning);
         let options = Options {
             baseline: self.baseline.map(RelativePathBuf::cli),
+            preset: self
+                .preset
+                .map(Into::into)
+                .or(self.strict.then_some(RulePreset::Strict)),
             environment: Some(EnvironmentOptions {
                 python_version: self.python_version.map(Into::into).map(RangedValue::cli),
                 python_platform: self
@@ -330,6 +348,21 @@ pub(crate) struct ServerCommand {
     /// Exit with status 0 if ty is found, 1 if discovery fails, or 2 on an unexpected error.
     #[arg(long, hide = true)]
     pub(crate) find_executable: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum PresetArg {
+    Default,
+    Strict,
+}
+
+impl From<PresetArg> for RulePreset {
+    fn from(value: PresetArg) -> Self {
+        match value {
+            PresetArg::Default => Self::Default,
+            PresetArg::Strict => Self::Strict,
+        }
+    }
 }
 
 /// A list of rules to enable or disable with a given severity.

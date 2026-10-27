@@ -21,6 +21,9 @@ pub struct LintMetadata {
     /// The default level of the lint if the user doesn't specify one.
     pub default_level: Level,
 
+    /// Whether the strict preset raises this lint to an error.
+    pub strict: bool,
+
     pub status: LintStatus,
 
     /// The source file in which the lint is declared.
@@ -155,6 +158,7 @@ pub const fn lint_metadata_defaults(status: LintStatus) -> LintMetadata {
         summary: "",
         raw_documentation: "",
         default_level: Level::Error,
+        strict: false,
         status,
         file: "",
         line: 1,
@@ -685,6 +689,9 @@ pub enum LintSource {
     /// The user didn't enable the rule explicitly, instead it's enabled by default.
     #[default]
     Default,
+
+    /// The rule was enabled by the strict preset.
+    Strict,
 
     /// The rule was enabled by using a CLI argument
     Cli,

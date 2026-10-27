@@ -86,6 +86,22 @@ pub struct Options {
     #[option_group]
     pub src: Option<SrcOptions>,
 
+    /// Selects the project-wide base set of rule severities.
+    ///
+    /// The `default` preset uses each rule's default severity. The `strict` preset
+    /// additionally reports `unannotated-parameter`, `missing-type-argument`,
+    /// `missing-override-decorator`, `unused-ignore-comment`, and
+    /// `unused-type-ignore-comment` as errors.
+    ///
+    /// Explicit rule settings, including per-file overrides, take precedence over the preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[option(
+        default = r#""default""#,
+        value_type = r#""default" | "strict""#,
+        example = r#"preset = "strict""#
+    )]
+    pub preset: Option<RulePreset>,
+
     /// Configures the enabled rules and their severity.
     ///
     /// The keys are either rule names or `all` to set a default severity for all rules.
@@ -548,7 +564,7 @@ impl Options {
         let analysis = strategy.fallback(analysis_result, |_| AnalysisSettings::default())?;
 
         let overrides = self
-            .to_overrides_settings(db, context.configuration_root(), &mut diagnostics)
+            .to_overrides_settings(db, context.configuration_root(), &rules, &mut diagnostics)
             .map_err(|err| ToSettingsError {
                 diagnostic: err,
                 output_format: terminal.output_format,
@@ -577,13 +593,24 @@ impl Options {
         db: &dyn Db,
         diagnostics: &mut Vec<OptionDiagnostic>,
     ) -> RuleSelection {
-        self.rules.or_default().to_rule_selection(db, diagnostics)
+        let registry = db.lint_registry();
+        let mut selection = RuleSelection::from_registry(registry);
+        if self.preset == Some(RulePreset::Strict) {
+            for lint in registry.lints().iter().filter(|lint| lint.strict) {
+                selection.enable(*lint, Severity::Error, LintSource::Strict);
+            }
+        }
+        if let Some(rules) = &self.rules {
+            rules.apply_to(db, &mut selection, diagnostics);
+        }
+        selection
     }
 
     fn to_overrides_settings(
         &self,
         db: &dyn Db,
         project_root: &SystemPath,
+        global_rules: &RuleSelection,
         diagnostics: &mut Vec<OptionDiagnostic>,
     ) -> Result<Vec<Override>, Box<OptionDiagnostic>> {
         let override_options = &**self.overrides.or_default();
@@ -594,7 +621,7 @@ impl Options {
             let override_instance = override_option.to_override(
                 db,
                 project_root,
-                self.rules.as_ref(),
+                global_rules,
                 self.analysis.as_ref(),
                 diagnostics,
             )?;
@@ -1159,6 +1186,21 @@ impl SrcOptions {
 }
 
 #[derive(
+    Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, get_size2::GetSize,
+)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum RulePreset {
+    #[default]
+    Default,
+    Strict,
+}
+
+impl Combine for RulePreset {
+    fn combine_with(&mut self, _other: Self) {}
+}
+
+#[derive(
     Debug, Default, Clone, Eq, PartialEq, Combine, Serialize, Deserialize, Hash, get_size2::GetSize,
 )]
 #[serde(rename_all = "kebab-case", transparent)]
@@ -1181,16 +1223,13 @@ impl FromIterator<(RangedValue<String>, RangedValue<Level>)> for Rules {
 }
 
 impl Rules {
-    /// Convert the rules to a `RuleSelection` with diagnostics.
-    pub(crate) fn to_rule_selection(
+    pub(crate) fn apply_to(
         &self,
         db: &dyn Db,
+        selection: &mut RuleSelection,
         diagnostics: &mut Vec<OptionDiagnostic>,
-    ) -> RuleSelection {
+    ) {
         let registry = db.lint_registry();
-
-        // Initialize the selection with the defaults
-        let mut selection = RuleSelection::from_registry(registry);
 
         for (rule_name, level) in &self.inner {
             let source = rule_name.source();
@@ -1241,8 +1280,6 @@ impl Rules {
                 }
             }
         }
-
-        selection
     }
 
     fn is_empty(&self) -> bool {
@@ -2053,7 +2090,7 @@ trait ToOverride {
         &self,
         db: &dyn Db,
         project_root: &SystemPath,
-        global_rules: Option<&Rules>,
+        global_rules: &RuleSelection,
         global_analysis: Option<&AnalysisOptions>,
         diagnostics: &mut Vec<OptionDiagnostic>,
     ) -> Result<Option<Override>, Box<OptionDiagnostic>>;
@@ -2064,7 +2101,7 @@ impl ToOverride for RangedValue<OverrideOptions> {
         &self,
         db: &dyn Db,
         project_root: &SystemPath,
-        global_rules: Option<&Rules>,
+        global_rules: &RuleSelection,
         global_analysis: Option<&AnalysisOptions>,
         diagnostics: &mut Vec<OptionDiagnostic>,
     ) -> Result<Option<Override>, Box<OptionDiagnostic>> {
@@ -2197,15 +2234,8 @@ impl ToOverride for RangedValue<OverrideOptions> {
 
         let files = IncludeExcludeFilter::new(include, exclude);
 
-        // Merge global rules with override rules, with override rules taking precedence
-        let mut merged_rules = rules.into_owned();
-
-        if let Some(global_rules) = global_rules {
-            merged_rules = merged_rules.combine(global_rules.clone());
-        }
-
-        // Convert merged rules to rule selection
-        let rule_selection = merged_rules.to_rule_selection(db, diagnostics);
+        let mut rule_selection = global_rules.clone();
+        rules.apply_to(db, &mut rule_selection, diagnostics);
 
         let mut merged_analysis = analysis.into_owned();
 

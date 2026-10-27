@@ -598,6 +598,9 @@ impl Drop for LintDiagnosticGuard<'_, '_> {
                 LintSource::Default => {
                     format!("rule `{rule}` is enabled by default")
                 }
+                LintSource::Strict => {
+                    format!("rule `{rule}` is enabled by the strict preset")
+                }
                 LintSource::Cli => {
                     format!("rule `{rule}` was selected on the command line")
                 }

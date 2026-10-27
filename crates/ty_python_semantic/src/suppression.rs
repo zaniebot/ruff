@@ -32,6 +32,7 @@ declare_lint! {
         summary: "detects unused `ty: ignore` comments",
         status: LintStatus::stable("0.0.1-alpha.1"),
         default_level: Level::Warn,
+        strict: true,
     }
 }
 
@@ -41,6 +42,7 @@ declare_lint! {
         summary: "detects unused `type: ignore` comments",
         status: LintStatus::stable("0.0.14"),
         default_level: Level::Warn,
+        strict: true,
     }
 }
 

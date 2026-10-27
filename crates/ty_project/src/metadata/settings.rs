@@ -207,14 +207,13 @@ fn merge_overrides(db: &dyn Db, overrides: Vec<Arc<InnerOverrideOptions>>, _: ()
         merged.combine_with((*option).clone());
     }
 
-    let metadata = db.project().metadata(db);
+    let project = db.project();
+    let metadata = project.metadata(db);
 
-    // Merge with the project level options by replaying the individual options
-    // in the correct precedence order.
+    // Analysis options must be combined before their defaults are filled in.
     for options in metadata
         .options_in_precedence_order(metadata.options(), metadata.uv_workspace_options.as_deref())
     {
-        merged.rules.combine_with(options.rules.clone());
         merged.analysis.combine_with(options.analysis.clone());
     }
 
@@ -222,12 +221,14 @@ fn merge_overrides(db: &dyn Db, overrides: Vec<Arc<InnerOverrideOptions>>, _: ()
         return FileSettings::Global;
     }
 
-    let rules = merged.rules.unwrap_or_default();
+    let mut rules = project.settings(db).rules().clone();
     let analysis = merged.analysis.unwrap_or_default();
 
     // It's okay to ignore the errors here because the rules are eagerly validated
     // during `overrides.to_settings()`.
-    let rules = rules.to_rule_selection(db, &mut Vec::new());
+    if let Some(overrides) = merged.rules {
+        overrides.apply_to(db, &mut rules, &mut Vec::new());
+    }
     let analysis = analysis.to_settings(db, &mut Vec::new());
 
     FileSettings::File(Arc::new(OverrideSettings { rules, analysis }))

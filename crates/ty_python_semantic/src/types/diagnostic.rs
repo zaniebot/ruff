@@ -138,6 +138,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&MISSING_ARGUMENT);
     registry.register_lint(&MISSING_DIRECT_DEPENDENCY);
     registry.register_lint(&MISSING_TYPE_ARGUMENT);
+    registry.register_lint(&UNANNOTATED_PARAMETER);
     registry.register_lint(&NO_MATCHING_OVERLOAD);
     registry.register_lint(&NON_CALLABLE_INIT_SUBCLASS);
     registry.register_lint(&NOT_SUBSCRIPTABLE);
@@ -841,6 +842,17 @@ declare_lint! {
         summary: "detects generic types used without explicit type parameters in type expressions",
         status: LintStatus::stable("0.0.45"),
         default_level: Level::Ignore,
+        strict: true,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/unannotated-parameter.md")]
+    pub(crate) static UNANNOTATED_PARAMETER = {
+        summary: "detects function parameters without a type annotation",
+        status: LintStatus::stable("0.0.93"),
+        default_level: Level::Ignore,
+        strict: true,
     }
 }
 
@@ -1094,6 +1106,7 @@ declare_lint! {
         summary: "detects methods that override a superclass member without an `@override` annotation",
         status: LintStatus::stable("0.0.41"),
         default_level: Level::Ignore,
+        strict: true,
     }
 }
 
